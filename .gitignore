@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Build and native extensions
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+
+# IDE and local tooling
+.idea/
+.vscode/
+
+# Experiment outputs
+*.log
+trainlog.json
+test_metrics.json
+*.pt
+*.pth
+*.ckpt
+runs/
+wandb/
+outputs/
+checkpoints/
+tmp/
+logs/
+
+# OS metadata
+.DS_Store
+Thumbs.db
