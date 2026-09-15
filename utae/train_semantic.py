@@ -42,13 +42,13 @@ parser.add_argument(
         "ucpmamba_directvss",
         "ucpmamba_mean",
         "ucpmamba_plainlstm",
+        "mm_ucpmamba",
         "buconvlstm",
     ],
     help=(
         "Semantic segmentation architecture. Use uconvlstm for the original "
         "baseline, ucpmamba, ucpmamba_vmambav2, ucpmamba_mamba2, and "
-        "ucpmamba_mean for "
-        "controlled comparisons."
+        "ucpmamba_mean, or mm_ucpmamba for independent Optical-SAR fusion."
     ),
 )
 ## U-TAE Hyperparameters
@@ -58,6 +58,41 @@ parser.add_argument("--decoder_widths", default="[32,32,64,128]", type=str)
 # 指定解码器的每层通道数
 parser.add_argument("--out_conv", default="[32, 20]")
 # 指定输出卷积的层配置
+parser.add_argument("--optical-input-dim", dest="optical_input_dim", default=10, type=int)
+parser.add_argument("--sar-input-dim", dest="sar_input_dim", default=3, type=int)
+parser.add_argument(
+    "--fusion-mode", dest="fusion_mode", choices=["concat", "qaf"], default="concat"
+)
+complementary_group = parser.add_mutually_exclusive_group()
+complementary_group.add_argument(
+    "--use-complementary-residual",
+    dest="use_complementary_residual",
+    action="store_true",
+)
+complementary_group.add_argument(
+    "--no-complementary-residual",
+    dest="use_complementary_residual",
+    action="store_false",
+)
+parser.set_defaults(use_complementary_residual=True)
+parser.add_argument("--use-quality-temporal", dest="use_quality_temporal", action="store_true")
+parser.add_argument("--quality-lambda", dest="quality_lambda", default=1.0, type=float)
+parser.add_argument("--modality-dropout", dest="modality_dropout", default=0.0, type=float)
+parser.add_argument("--optical-satellite", dest="optical_satellite", default="S2", type=str)
+parser.add_argument(
+    "--sar-orbits",
+    dest="sar_orbits",
+    choices=["both", "S1A", "S1D"],
+    default="both",
+    help="Active SAR orbit(s); both is the formal tri-modal default.",
+)
+parser.add_argument(
+    "--sar-satellite",
+    dest="sar_satellite",
+    choices=["S1A", "S1D"],
+    default=None,
+    help="Backward-compatible alias selecting one SAR orbit.",
+)
 parser.add_argument("--str_conv_k", default=4, type=int)
 # 表示时空卷积的核大小
 parser.add_argument("--str_conv_s", default=2, type=int)
@@ -175,6 +210,55 @@ PASTIS_LABEL_NAMES = {
     13: "Potatoes", 14: "Leguminous fodder", 15: "Soybeans",
     16: "Orchard", 17: "Mixed cereal", 18: "Sorghum", 19: "Void label",
 }
+
+
+def _active_sar_orbits(config):
+    legacy_orbit = getattr(config, "sar_satellite", None)
+    selection = legacy_orbit or getattr(config, "sar_orbits", "both")
+    if selection == "both":
+        return ("S1A", "S1D")
+    if selection in {"S1A", "S1D"}:
+        return (selection,)
+    raise ValueError("SAR orbit selection must be 'both', 'S1A', or 'S1D'")
+
+
+def _mm_satellites(config):
+    return [getattr(config, "optical_satellite", "S2"), *_active_sar_orbits(config)]
+
+
+def _set_mm_experiment_metadata(config):
+    if config.model != "mm_ucpmamba":
+        return
+    modalities = _mm_satellites(config)
+    all_channels = {"S2": 10, "S1A": 3, "S1D": 3}
+    config.active_modalities = modalities
+    config.input_channels = {sat: all_channels[sat] for sat in modalities}
+    config.mamba_variant = "Mamba1-SS2D-v01_noz-d_state16-ratio1.0"
+    config.experiment_name = "mm_ucpmamba_" + "_".join(s.lower() for s in modalities)
+    if os.path.normpath(config.res_dir) == os.path.normpath("./results"):
+        config.res_dir = os.path.join(config.res_dir, config.experiment_name)
+
+
+def _forward_model(model, x, dates, config):
+    if config.model != "mm_ucpmamba":
+        return model(x, batch_positions=dates)
+    if not isinstance(x, dict) or not isinstance(dates, dict):
+        raise TypeError("mm_ucpmamba expects a multimodal dict batch")
+    optical_satellite = getattr(config, "optical_satellite", "S2")
+    sar_orbits = _active_sar_orbits(config)
+    if optical_satellite not in x or optical_satellite not in dates:
+        raise KeyError("optical satellite is missing from the multimodal batch")
+    for orbit in sar_orbits:
+        if orbit not in x or orbit not in dates:
+            raise KeyError(f"{orbit} is missing from the multimodal batch")
+    return model(
+        x[optical_satellite],
+        x.get("S1A"),
+        x.get("S1D"),
+        batch_positions_s2=dates.get(optical_satellite),
+        batch_positions_s1a=dates.get("S1A"),
+        batch_positions_s1d=dates.get("S1D"),
+    )
 
 
 def _diagnostic_ignore_labels(config):
@@ -338,10 +422,10 @@ def iterate(
 
         if mode != "train":
             with torch.no_grad():
-                out = model(x, batch_positions=dates)
+                out = _forward_model(model, x, dates, config)
         else:
             optimizer.zero_grad()
-            out = model(x, batch_positions=dates)
+            out = _forward_model(model, x, dates, config)
 
         loss = criterion(out, y)
         if mode == "train":
@@ -552,6 +636,7 @@ def main(config):
 
     np.random.seed(config.rdm_seed)
     torch.manual_seed(config.rdm_seed)
+    _set_mm_experiment_metadata(config)
     prepare_output(config)
     # 调用 prepare_output 函数，创建存储结果的目录结构
     device = torch.device(config.device)
@@ -565,13 +650,14 @@ def main(config):
         # 如果指定了折，fold 被固定为对应索引值（config.fold - 1）。
 
         # Dataset definition
+        sats = _mm_satellites(config) if config.model == "mm_ucpmamba" else ["S2"]
         dt_args = dict(
             folder=config.dataset_folder,
             norm=True,
             reference_date=config.ref_date,
             mono_date=config.mono_date,
             target="semantic",
-            sats=["S2"],
+            sats=sats,
         )
         # 单日期模式，设置为 None 表示多时序数据。
 
@@ -647,6 +733,8 @@ def main(config):
         # 用于调试冻结或解冻特定层的问题
         model = model.to(device)
         model.apply(weight_init)
+        if config.model == "mm_ucpmamba":
+            model.reset_quality_fusion_initialization()
 
         # Optimizer and Loss
         optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
@@ -705,6 +793,13 @@ def main(config):
                             "epoch": epoch,
                             "state_dict": model.state_dict(),
                             "optimizer": optimizer.state_dict(),
+                            "model_metadata": {
+                                "model_name": config.model,
+                                "active_modalities": getattr(config, "active_modalities", ["S2"]),
+                                "input_channels": getattr(config, "input_channels", {"S2": 10}),
+                                "fusion_mode": getattr(config, "fusion_mode", None),
+                                "mamba_variant": getattr(config, "mamba_variant", None),
+                            },
                         },
                         os.path.join(
                             config.res_dir, "Fold_{}".format(test_fold), "model.pth.tar"
@@ -722,7 +817,8 @@ def main(config):
                 os.path.join(
                     config.res_dir, "Fold_{}".format(test_fold), "model.pth.tar"
                 )
-            )["state_dict"]
+            )["state_dict"],
+            strict=True,
         )
         model.eval()
 

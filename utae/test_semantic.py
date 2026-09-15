@@ -17,7 +17,14 @@ from src import utils, model_utils
 from src.dataset import PASTIS_Dataset
 from src.folds import FOLD_SPLITS, get_fold_split
 
-from train_semantic import iterate, overall_performance, save_results, prepare_output
+from train_semantic import (
+    _mm_satellites,
+    _set_mm_experiment_metadata,
+    iterate,
+    overall_performance,
+    save_results,
+    prepare_output,
+)
 
 parser = argparse.ArgumentParser()
 # Model parameters
@@ -28,7 +35,7 @@ parser.add_argument(
         "utae", "unet3d", "fpn", "convlstm", "convgru", "uconvlstm",
         "ucpmamba", "ucpmamba_vmambav2", "ucpmamba_mamba2",
         "ucpmamba_directvss",
-        "ucpmamba_mean", "ucpmamba_plainlstm", "buconvlstm",
+        "ucpmamba_mean", "ucpmamba_plainlstm", "mm_ucpmamba", "buconvlstm",
     ],
     help="Override the model name stored in conf.json",
 )
@@ -78,10 +85,25 @@ parser.add_argument(
     type=int,
     help="Interval in batches between display of training metrics",
 )
+parser.add_argument(
+    "--sar-orbits",
+    dest="sar_orbits",
+    choices=["both", "S1A", "S1D"],
+    default=None,
+    help="Override the SAR orbit selection stored in conf.json.",
+)
+parser.add_argument(
+    "--sar-satellite",
+    dest="sar_satellite",
+    choices=["S1A", "S1D"],
+    default=None,
+    help="Backward-compatible single-orbit override.",
+)
 
 def main(config):
     np.random.seed(config.rdm_seed)
     torch.manual_seed(config.rdm_seed)
+    _set_mm_experiment_metadata(config)
     device = torch.device(config.device)
     prepare_output(config)
     with open(os.path.join(config.res_dir, "conf.json"), "w") as file:
@@ -101,13 +123,14 @@ def main(config):
         checkpoint_fold = getattr(config, "checkpoint_fold", None) or test_fold
 
         # Dataset definition
+        sats = _mm_satellites(config) if config.model == "mm_ucpmamba" else ["S2"]
         dt_test = PASTIS_Dataset(
             folder=config.dataset_folder,
             norm=True,
             reference_date=config.ref_date,
             mono_date=config.mono_date,
             target="semantic",
-            sats=["S2"],
+            sats=sats,
             folds=test_fold_ids,
         )
         collate_fn = lambda x: utils.pad_collate(x, pad_value=config.pad_value)
@@ -128,7 +151,7 @@ def main(config):
             ),
             map_location=device,
         )
-        model.load_state_dict(sd["state_dict"])
+        model.load_state_dict(sd["state_dict"], strict=True)
 
         # Loss
         weights = torch.ones(config.num_classes, device=device).float()

@@ -1,4 +1,4 @@
-from src.backbones import utae, unet3d, convlstm, convgru, fpn, ucpmamba, uconvlstm
+from src.backbones import utae, unet3d, convlstm, convgru, fpn, ucpmamba, uconvlstm, mm_ucpmamba
 
 
 def get_model(config, mode="semantic"):
@@ -70,6 +70,38 @@ def get_model(config, mode="semantic"):
                 encoder=False,
                 padding_mode=config.padding_mode,
                 pad_value=config.pad_value,
+            )
+        elif config.model == "mm_ucpmamba":
+            sar_orbits = getattr(config, "sar_satellite", None) or getattr(
+                config, "sar_orbits", "both"
+            )
+            model = mm_ucpmamba.MMUCPMamba(
+                optical_input_dim=getattr(config, "optical_input_dim", 10),
+                sar_input_dim=getattr(config, "sar_input_dim", 3),
+                encoder_widths=config.encoder_widths,
+                decoder_widths=config.decoder_widths,
+                out_conv=config.out_conv,
+                str_conv_k=config.str_conv_k,
+                str_conv_s=config.str_conv_s,
+                str_conv_p=config.str_conv_p,
+                input_size=128,
+                encoder_norm=config.encoder_norm,
+                hidden_dim=64,
+                padding_mode=config.padding_mode,
+                pad_value=config.pad_value,
+                sar_orbits=sar_orbits,
+                #"concat"：通道拼接再压回；"qaf"：质量感知加权融合
+                fusion_mode=getattr(config, "fusion_mode", "concat"),
+                #仅qaf时有效，是否加互补残差
+                use_complementary_residual=getattr(
+                    config, "use_complementary_residual", True
+                ),
+                #是否用质量引导的时序注意力
+                use_quality_temporal=getattr(config, "use_quality_temporal", False),
+                #质量项在时序注意力里的权重
+                quality_lambda=getattr(config, "quality_lambda", 1.0),
+                #训练时随机丢弃某一模态特征（不会同时丢两边），增强鲁棒性
+                modality_dropout=getattr(config, "modality_dropout", 0.0),
             )
         elif config.model in {
             "ucpmamba",
