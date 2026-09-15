@@ -78,6 +78,9 @@ parser.set_defaults(use_complementary_residual=True)
 parser.add_argument("--use-quality-temporal", dest="use_quality_temporal", action="store_true")
 parser.add_argument("--quality-lambda", dest="quality_lambda", default=1.0, type=float)
 parser.add_argument("--modality-dropout", dest="modality_dropout", default=0.0, type=float)
+parser.add_argument("--temporal-dropout-s2", default=0.4, type=float)
+parser.add_argument("--temporal-dropout-s1a", default=0.2, type=float)
+parser.add_argument("--temporal-dropout-s1d", default=0.2, type=float)
 parser.add_argument("--optical-satellite", dest="optical_satellite", default="S2", type=str)
 parser.add_argument(
     "--sar-orbits",
@@ -662,7 +665,22 @@ def main(config):
         # 单日期模式，设置为 None 表示多时序数据。
 
         # **dt_args: 传入通用的参数，包括数据集路径、归一化设置、基准日期、模式等。
-        dt_train = PASTIS_Dataset(**dt_args, folds=train_folds, cache=config.cache)
+        # 默认情况下不做时间 dropout（设为 None），也就是数据集会使用完整的时间序列。
+        temporal_dropout = None
+        # 只有当选用的模型是多模态 UCPMamba（mm_ucpmamba）时，才启用时间 dropout，并且为三种模态分别从命令行/配置里读取各自的丢弃概率，组成一个字典。
+        if config.model == "mm_ucpmamba":
+            temporal_dropout = {
+                "S2": config.temporal_dropout_s2,
+                "S1A": config.temporal_dropout_s1a,
+                "S1D": config.temporal_dropout_s1d,
+            }
+        #最后用这些参数构造训练用的 PASTIS 数据集对象。
+        dt_train = PASTIS_Dataset(
+            **dt_args,
+            folds=train_folds,
+            cache=config.cache,
+            temporal_dropout=temporal_dropout,
+        )
         dt_val = PASTIS_Dataset(**dt_args, folds=val_fold, cache=config.cache)
         dt_test = PASTIS_Dataset(**dt_args, folds=[test_fold])
         torch.cuda.empty_cache()

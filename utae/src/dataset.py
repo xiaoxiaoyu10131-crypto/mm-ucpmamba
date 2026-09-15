@@ -8,6 +8,8 @@ import pandas as pd
 import torch
 import torch.utils.data as tdata
 
+from src.temporal_dropout import apply_temporal_dropout
+
 
 class PASTIS_Dataset(tdata.Dataset):
     def __init__(
@@ -22,6 +24,7 @@ class PASTIS_Dataset(tdata.Dataset):
         class_mapping=None,
         mono_date=None,
         sats=["S2"],
+        temporal_dropout=None,
     ):
         """
         Pytorch Dataset class to load samples from the PASTIS dataset, for semantic and
@@ -94,6 +97,7 @@ class PASTIS_Dataset(tdata.Dataset):
         # 用于将原始类别标签转换为新的类别标签
         self.target = target
         self.sats = sats
+        self.temporal_dropout = temporal_dropout or {}
 
         # Get metadata
         # 用于读取和处理地理空间元数据以及卫星数据的时间信息
@@ -346,6 +350,11 @@ class PASTIS_Dataset(tdata.Dataset):
                 }
                 data = {s: data[s][mono_date[s]].unsqueeze(0) for s in self.sats}
                 dates = {s: dates[s][mono_date[s]] for s in self.sats}
+
+        if self.temporal_dropout:
+            data, dates = apply_temporal_dropout(
+                data, dates, self.temporal_dropout
+            )
 
         if self.mem16:
             data = {k: v.float() for k, v in data.items()}
