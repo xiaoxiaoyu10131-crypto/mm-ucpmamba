@@ -21,6 +21,10 @@ from src.dataset import PASTIS_Dataset
 from src.folds import FOLD_SPLITS, get_fold_split
 from src.learning.metrics import confusion_matrix_analysis
 from src.learning.miou import IoU
+from src.learning.gradient_accumulation import (
+    accumulation_window_size,
+    is_accumulation_boundary,
+)
 from src.learning.weight_init import weight_init
 
 parser = argparse.ArgumentParser()
@@ -156,6 +160,12 @@ parser.add_argument(
 parser.add_argument("--epochs", default=100, type=int, help="Number of epochs per fold")
 # 每折交叉验证的训练轮数
 parser.add_argument("--batch_size", default=4, type=int, help="Batch size")
+parser.add_argument(
+    "--accumulation_steps",
+    default=1,
+    type=int,
+    help="Number of micro-batches accumulated before each optimizer update",
+)
 parser.add_argument("--lr", default=0.001, type=float, help="Learning rate")
 parser.add_argument("--mono_date", default=None, type=str)
 # 单一日期模式的配置
@@ -414,6 +424,11 @@ def iterate(
     # 计算多分类任务的交并比和准确率
 
     t_start = time.time()
+    accumulation_steps = getattr(config, "accumulation_steps", 1)
+    if mode == "train":
+        if optimizer is None:
+            raise ValueError("Training requires an optimizer")
+        optimizer.zero_grad()
     for i, batch in enumerate(data_loader):
         if device is not None:
             batch = recursive_todevice(batch, device)
@@ -427,13 +442,18 @@ def iterate(
             with torch.no_grad():
                 out = _forward_model(model, x, dates, config)
         else:
-            optimizer.zero_grad()
             out = _forward_model(model, x, dates, config)
 
         loss = criterion(out, y)
         if mode == "train":
-            loss.backward()
-            if config.diagnostics:
+            window_size = accumulation_window_size(
+                i, len(data_loader), accumulation_steps
+            )
+            (loss / window_size).backward()
+            update_boundary = is_accumulation_boundary(
+                i, len(data_loader), accumulation_steps
+            )
+            if config.diagnostics and update_boundary:
                 total_grad_sq = 0.0
                 for parameter in model.parameters():
                     if parameter.grad is not None:
@@ -452,7 +472,9 @@ def iterate(
                     classifier_gradient_sum += classifier_grad_norm
                     classifier_potato_gradient_sum += classifier_potato_grad_norm
                 gradient_batches += 1
-            optimizer.step()
+            if update_boundary:
+                optimizer.step()
+                optimizer.zero_grad()
 
         with torch.no_grad():
             pred = out.argmax(dim=1)
@@ -639,8 +661,19 @@ def main(config):
 
     np.random.seed(config.rdm_seed)
     torch.manual_seed(config.rdm_seed)
+    config.accumulation_steps = getattr(config, "accumulation_steps", 1)
+    if config.accumulation_steps < 1:
+        raise ValueError("accumulation_steps must be at least 1")
+    config.effective_batch_size = config.batch_size * config.accumulation_steps
     _set_mm_experiment_metadata(config)
     prepare_output(config)
+    print(
+        "Micro-batch {}, accumulation {}, effective batch {}".format(
+            config.batch_size,
+            config.accumulation_steps,
+            config.effective_batch_size,
+        )
+    )
     # 调用 prepare_output 函数，创建存储结果的目录结构
     device = torch.device(config.device)
 
