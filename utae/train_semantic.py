@@ -25,7 +25,11 @@ from src.learning.gradient_accumulation import (
     accumulation_window_size,
     is_accumulation_boundary,
 )
-from src.learning.weight_init import weight_init
+from src.learning.weight_init import (
+    find_final_batchnorm,
+    reset_final_batchnorm_identity,
+    weight_init,
+)
 
 parser = argparse.ArgumentParser()
 # Model parameters
@@ -167,6 +171,15 @@ parser.add_argument(
     help="Number of micro-batches accumulated before each optimizer update",
 )
 parser.add_argument("--lr", default=0.001, type=float, help="Learning rate")
+parser.add_argument(
+    "--final-bn-init",
+    choices=["legacy", "ones"],
+    default="legacy",
+    help=(
+        "Initialization for the final class BatchNorm. "
+        "Use 'ones' for H1; the default preserves the legacy random initialization."
+    ),
+)
 parser.add_argument("--mono_date", default=None, type=str)
 # 单一日期模式的配置
 parser.add_argument("--ref_date", default="2018-09-01", type=str)
@@ -292,11 +305,7 @@ def _classifier_parameter(model, num_classes):
 
 
 def _classifier_batchnorm(model, num_classes):
-    candidates = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.BatchNorm2d) and module.num_features == num_classes:
-            candidates.append((name, module))
-    return candidates[-1] if candidates else (None, None)
+    return find_final_batchnorm(model, num_classes)
 
 
 def _diagnostic_update(stats, out, y, config, raw_logits=None):
@@ -784,6 +793,14 @@ def main(config):
         # 用于调试冻结或解冻特定层的问题
         model = model.to(device)
         model.apply(weight_init)
+        if config.final_bn_init == "ones":
+            final_bn_name = reset_final_batchnorm_identity(
+                model, config.num_classes
+            )
+            print(
+                f"H1 final BatchNorm identity initialization: {final_bn_name} "
+                "(weight=1, bias=0)"
+            )
         if config.model == "mm_ucpmamba":
             model.reset_quality_fusion_initialization()
 

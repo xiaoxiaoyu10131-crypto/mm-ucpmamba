@@ -1,6 +1,30 @@
 import torch.nn as nn
 import torch.nn.init as init
 
+
+def find_final_batchnorm(model, num_features):
+    """Return the last BatchNorm2d matching the classifier channel count."""
+    candidates = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, nn.BatchNorm2d)
+        and module.num_features == num_features
+    ]
+    return candidates[-1] if candidates else (None, None)
+
+
+def reset_final_batchnorm_identity(model, num_features):
+    """Reset only the final classifier BatchNorm affine parameters."""
+    name, module = find_final_batchnorm(model, num_features)
+    if module is None:
+        raise ValueError(
+            f"No BatchNorm2d with num_features={num_features} was found"
+        )
+    init.ones_(module.weight)
+    init.zeros_(module.bias)
+    return name
+
+
 def weight_init(m):
     '''
     Initializes a model's parameters.
