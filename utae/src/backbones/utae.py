@@ -322,27 +322,44 @@ class DownConvBlock(TemporallySharedBlock):
 
 class UpConvBlock(nn.Module):
     def __init__(
-        self, d_in, d_out, k, s, p, norm="batch", d_skip=None, padding_mode="reflect"
+        self, d_in, d_out, k, s, p, norm="batch", d_skip=None,
+        padding_mode="reflect", n_groups=4
     ):
         super(UpConvBlock, self).__init__()
         d = d_out if d_skip is None else d_skip
+        if norm == "group":
+            if n_groups <= 0 or d % n_groups != 0 or d_out % n_groups != 0:
+                raise ValueError(
+                    "GroupNorm groups must be positive and divide decoder channels"
+                )
+
+            def decoder_norm(channels):
+                return nn.GroupNorm(num_groups=n_groups, num_channels=channels)
+        else:
+            decoder_norm = nn.BatchNorm2d
         self.skip_conv = nn.Sequential(
             nn.Conv2d(in_channels=d, out_channels=d, kernel_size=1),
-            nn.BatchNorm2d(d),
+            decoder_norm(d),
             nn.ReLU(),
         )
         self.up = nn.Sequential(
             nn.ConvTranspose2d(
                 in_channels=d_in, out_channels=d_out, kernel_size=k, stride=s, padding=p
             ),
-            nn.BatchNorm2d(d_out),
+            decoder_norm(d_out),
             nn.ReLU(),
         )
         self.conv1 = ConvLayer(
-            nkernels=[d_out + d, d_out], norm=norm, padding_mode=padding_mode
+            nkernels=[d_out + d, d_out],
+            norm=norm,
+            n_groups=n_groups,
+            padding_mode=padding_mode,
         )
         self.conv2 = ConvLayer(
-            nkernels=[d_out, d_out], norm=norm, padding_mode=padding_mode
+            nkernels=[d_out, d_out],
+            norm=norm,
+            n_groups=n_groups,
+            padding_mode=padding_mode,
         )
 
     def forward(self, input, skip):

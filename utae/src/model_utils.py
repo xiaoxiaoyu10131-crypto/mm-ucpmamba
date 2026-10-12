@@ -71,11 +71,29 @@ def get_model(config, mode="semantic"):
                 padding_mode=config.padding_mode,
                 pad_value=config.pad_value,
             )
-        elif config.model == "mm_ucpmamba":
+        elif config.model in {"mm_ucpmamba", "mm_ucpmamba_mid"}:
             sar_orbits = getattr(config, "sar_satellite", None) or getattr(
                 config, "sar_orbits", "both"
             )
-            model = mm_ucpmamba.MMUCPMamba(
+            model_class = mm_ucpmamba.MMUCPMamba
+            extra_kwargs = dict(
+                use_complementary_residual=getattr(config, "use_complementary_residual", True),
+                use_quality_temporal=getattr(config, "use_quality_temporal", False),
+                quality_lambda=getattr(config, "quality_lambda", 1.0),
+            )
+            if config.model == "mm_ucpmamba_mid":
+                from src.backbones.mm_ucpmamba_mid import MMUCPMambaMid
+
+                if getattr(config, "use_quality_temporal", False):
+                    raise ValueError("mm_ucpmamba_mid is the quality-free concat baseline")
+                model_class = MMUCPMambaMid
+                extra_kwargs = dict(
+                    num_bins=getattr(config, "mid_num_bins", 24),
+                    start_day=getattr(config, "mid_start_day", None),
+                    end_day=getattr(config, "mid_end_day", None),
+                    low_memory=getattr(config, "mid_low_memory", False),
+                )
+            model = model_class(
                 optical_input_dim=getattr(config, "optical_input_dim", 10),
                 sar_input_dim=getattr(config, "sar_input_dim", 3),
                 encoder_widths=config.encoder_widths,
@@ -86,22 +104,17 @@ def get_model(config, mode="semantic"):
                 str_conv_p=config.str_conv_p,
                 input_size=128,
                 encoder_norm=config.encoder_norm,
+                decoder_norm=getattr(config, "decoder_norm", "batch"),
+                decoder_groups=getattr(config, "decoder_groups", 8),
                 hidden_dim=64,
                 padding_mode=config.padding_mode,
                 pad_value=config.pad_value,
                 sar_orbits=sar_orbits,
                 #"concat"：通道拼接再压回；"qaf"：质量感知加权融合
                 fusion_mode=getattr(config, "fusion_mode", "concat"),
-                #仅qaf时有效，是否加互补残差
-                use_complementary_residual=getattr(
-                    config, "use_complementary_residual", True
-                ),
-                #是否用质量引导的时序注意力
-                use_quality_temporal=getattr(config, "use_quality_temporal", False),
-                #质量项在时序注意力里的权重
-                quality_lambda=getattr(config, "quality_lambda", 1.0),
                 #训练时随机丢弃某一模态特征（不会同时丢两边），增强鲁棒性
                 modality_dropout=getattr(config, "modality_dropout", 0.0),
+                **extra_kwargs,
             )
         elif config.model in {
             "ucpmamba",

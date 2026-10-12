@@ -177,6 +177,8 @@ class MMUCPMamba(nn.Module):
         str_conv_p=1,
         input_size=128,
         encoder_norm="group",
+        decoder_norm="batch",
+        decoder_groups=8,
         hidden_dim=64,
         padding_mode="reflect",
         pad_value=0,
@@ -199,6 +201,10 @@ class MMUCPMamba(nn.Module):
             raise ValueError("MMUCPMamba expects four encoder and decoder stages")
         if not 0.0 <= modality_dropout <= 1.0:
             raise ValueError("modality_dropout must be in [0, 1]")
+        if decoder_norm not in {"batch", "group"}:
+            raise ValueError("decoder_norm must be 'batch' or 'group'")
+        if decoder_groups <= 0:
+            raise ValueError("decoder_groups must be positive")
 
         self.fusion_mode = fusion_mode
         self.sar_orbits = ("S1A", "S1D") if sar_orbits == "both" else (sar_orbits,)
@@ -207,6 +213,8 @@ class MMUCPMamba(nn.Module):
         self.modality_dropout = float(modality_dropout)
         self.encoder_widths = list(encoder_widths)
         self.decoder_widths = list(decoder_widths)
+        self.decoder_norm = decoder_norm
+        self.decoder_groups = int(decoder_groups)
         needs_quality = fusion_mode == "qaf" or use_quality_temporal
         branch_kwargs = dict(
             encoder_widths=encoder_widths,
@@ -254,7 +262,8 @@ class MMUCPMamba(nn.Module):
                 k=str_conv_k,
                 s=str_conv_s,
                 p=str_conv_p,
-                norm="batch",
+                norm=decoder_norm,
+                n_groups=decoder_groups,
                 padding_mode=padding_mode,
             )
             for i in range(len(encoder_widths) - 1, 0, -1)

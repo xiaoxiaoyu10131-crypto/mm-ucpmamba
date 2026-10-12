@@ -4,6 +4,7 @@ Author: Vivien Sainte Fare Garnot (github/VSainteuf)
 License: MIT
 """
 import argparse
+from functools import partial
 import json
 import os
 import pickle as pkl
@@ -18,6 +19,8 @@ import torchnet as tnt
 # import torchtnt as tnt
 from src import utils, model_utils
 from src.dataset import PASTIS_Dataset
+from src.mm_collate import mid_pad_collate
+from src.backbones.mm_mid_memory import report_mid_oom
 from src.folds import FOLD_SPLITS, get_fold_split
 from src.learning.metrics import confusion_matrix_analysis
 from src.learning.miou import IoU
@@ -51,6 +54,7 @@ parser.add_argument(
         "ucpmamba_mean",
         "ucpmamba_plainlstm",
         "mm_ucpmamba",
+        "mm_ucpmamba_mid",
         "buconvlstm",
     ],
     help=(
@@ -70,6 +74,19 @@ parser.add_argument("--optical-input-dim", dest="optical_input_dim", default=10,
 parser.add_argument("--sar-input-dim", dest="sar_input_dim", default=3, type=int)
 parser.add_argument(
     "--fusion-mode", dest="fusion_mode", choices=["concat", "qaf"], default="concat"
+)
+parser.add_argument("--mid-num-bins", default=24, type=int)
+parser.add_argument(
+    "--mid-low-memory", action="store_true",
+    help="仅 mid 模型：GroupNorm 浅层分支重计算与 8 帧分块，减少激活显存。",
+)
+parser.add_argument(
+    "--mid-start-day", default=None, type=float,
+    help="mid 模型公共时间窗起点，相对 --ref_date 的天数（含起点）。",
+)
+parser.add_argument(
+    "--mid-end-day", default=None, type=float,
+    help="mid 模型公共时间窗终点，相对 --ref_date 的天数（不含终点）。",
 )
 complementary_group = parser.add_mutually_exclusive_group()
 complementary_group.add_argument(
@@ -113,6 +130,20 @@ parser.add_argument("--str_conv_p", default=1, type=int)
 parser.add_argument("--agg_mode", default="att_group", type=str)
 parser.add_argument("--encoder_norm", default="group", type=str)
 # 定义编码器的归一化类型
+parser.add_argument(
+    "--decoder-norm",
+    dest="decoder_norm",
+    choices=["batch", "group"],
+    default="batch",
+    help="Normalization used only inside the shared decoder up-blocks.",
+)
+parser.add_argument(
+    "--decoder-groups",
+    dest="decoder_groups",
+    default=8,
+    type=int,
+    help="Number of groups when --decoder-norm group is selected.",
+)
 parser.add_argument("--n_head", default=16, type=int)
 # 定义多头注意力的头数量
 parser.add_argument("--d_model", default=256, type=int)
@@ -252,24 +283,36 @@ def _mm_satellites(config):
     return [getattr(config, "optical_satellite", "S2"), *_active_sar_orbits(config)]
 
 
+def _is_mm_model(config):
+    return config.model in {"mm_ucpmamba", "mm_ucpmamba_mid"}
+
+
 def _set_mm_experiment_metadata(config):
-    if config.model != "mm_ucpmamba":
+    if not _is_mm_model(config):
         return
     modalities = _mm_satellites(config)
     all_channels = {"S2": 10, "S1A": 3, "S1D": 3}
     config.active_modalities = modalities
     config.input_channels = {sat: all_channels[sat] for sat in modalities}
     config.mamba_variant = "Mamba1-SS2D-v01_noz-d_state16-ratio1.0"
-    config.experiment_name = "mm_ucpmamba_" + "_".join(s.lower() for s in modalities)
+    config.experiment_name = config.model + "_" + "_".join(s.lower() for s in modalities)
+    if config.model == "mm_ucpmamba_mid":
+        config.mid_alignment = {
+            "num_bins": getattr(config, "mid_num_bins", 24),
+            "start_day": getattr(config, "mid_start_day", None),
+            "end_day": getattr(config, "mid_end_day", None),
+            "reference_date": config.ref_date,
+            "bounds": "[start_day,end_day)",
+        }
     if os.path.normpath(config.res_dir) == os.path.normpath("./results"):
         config.res_dir = os.path.join(config.res_dir, config.experiment_name)
 
 
 def _forward_model(model, x, dates, config):
-    if config.model != "mm_ucpmamba":
+    if not _is_mm_model(config):
         return model(x, batch_positions=dates)
     if not isinstance(x, dict) or not isinstance(dates, dict):
-        raise TypeError("mm_ucpmamba expects a multimodal dict batch")
+        raise TypeError("multimodal UCPMamba expects a multimodal dict batch")
     optical_satellite = getattr(config, "optical_satellite", "S2")
     sar_orbits = _active_sar_orbits(config)
     if optical_satellite not in x or optical_satellite not in dates:
@@ -277,6 +320,12 @@ def _forward_model(model, x, dates, config):
     for orbit in sar_orbits:
         if orbit not in x or orbit not in dates:
             raise KeyError(f"{orbit} is missing from the multimodal batch")
+    mask_kwargs = {}
+    if config.model == "mm_ucpmamba_mid":
+        mask_kwargs = {
+            "pad_masks": x.get("pad_masks"),
+            "valid_masks": x.get("valid_masks"),
+        }
     return model(
         x[optical_satellite],
         x.get("S1A"),
@@ -284,6 +333,7 @@ def _forward_model(model, x, dates, config):
         batch_positions_s2=dates.get(optical_satellite),
         batch_positions_s1a=dates.get("S1A"),
         batch_positions_s1d=dates.get("S1D"),
+        **mask_kwargs,
     )
 
 
@@ -458,7 +508,12 @@ def iterate(
             window_size = accumulation_window_size(
                 i, len(data_loader), accumulation_steps
             )
-            (loss / window_size).backward()
+            try:
+                (loss / window_size).backward()
+            except torch.cuda.OutOfMemoryError:
+                if config.model == "mm_ucpmamba_mid":
+                    report_mid_oom(x, device)
+                raise
             update_boundary = is_accumulation_boundary(
                 i, len(data_loader), accumulation_steps
             )
@@ -695,7 +750,7 @@ def main(config):
         # 如果指定了折，fold 被固定为对应索引值（config.fold - 1）。
 
         # Dataset definition
-        sats = _mm_satellites(config) if config.model == "mm_ucpmamba" else ["S2"]
+        sats = _mm_satellites(config) if _is_mm_model(config) else ["S2"]
         dt_args = dict(
             folder=config.dataset_folder,
             norm=True,
@@ -710,7 +765,7 @@ def main(config):
         # 默认情况下不做时间 dropout（设为 None），也就是数据集会使用完整的时间序列。
         temporal_dropout = None
         # 只有当选用的模型是多模态 UCPMamba（mm_ucpmamba）时，才启用时间 dropout，并且为三种模态分别从命令行/配置里读取各自的丢弃概率，组成一个字典。
-        if config.model == "mm_ucpmamba":
+        if _is_mm_model(config):
             temporal_dropout = {
                 "S2": config.temporal_dropout_s2,
                 "S1A": config.temporal_dropout_s1a,
@@ -728,6 +783,8 @@ def main(config):
         torch.cuda.empty_cache()
 
         collate_fn = lambda x: utils.pad_collate(x, pad_value=config.pad_value)
+        if config.model == "mm_ucpmamba_mid":
+            collate_fn = partial(mid_pad_collate, pad_value=config.pad_value)
         # 使用自定义的 pad_collate 函数对批数据进行动态填充（padding）。
         # pad_value：填充值，避免时间步长不一致导致的错误。
         train_loader = data.DataLoader(
@@ -867,6 +924,7 @@ def main(config):
                                 "input_channels": getattr(config, "input_channels", {"S2": 10}),
                                 "fusion_mode": getattr(config, "fusion_mode", None),
                                 "mamba_variant": getattr(config, "mamba_variant", None),
+                                "mid_alignment": getattr(config, "mid_alignment", None),
                             },
                         },
                         os.path.join(

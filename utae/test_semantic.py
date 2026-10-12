@@ -4,6 +4,7 @@ Author: Vivien Sainte Fare Garnot (github/VSainteuf)
 License: MIT
 """
 import argparse
+from functools import partial
 import json
 import os
 import pprint
@@ -15,9 +16,11 @@ import torch.utils.data as data
 
 from src import utils, model_utils
 from src.dataset import PASTIS_Dataset
+from src.mm_collate import mid_pad_collate
 from src.folds import FOLD_SPLITS, get_fold_split
 
 from train_semantic import (
+    _is_mm_model,
     _mm_satellites,
     _set_mm_experiment_metadata,
     iterate,
@@ -35,7 +38,7 @@ parser.add_argument(
         "utae", "unet3d", "fpn", "convlstm", "convgru", "uconvlstm",
         "ucpmamba", "ucpmamba_vmambav2", "ucpmamba_mamba2",
         "ucpmamba_directvss",
-        "ucpmamba_mean", "ucpmamba_plainlstm", "mm_ucpmamba", "buconvlstm",
+        "ucpmamba_mean", "ucpmamba_plainlstm", "mm_ucpmamba", "mm_ucpmamba_mid", "buconvlstm",
     ],
     help="Override the model name stored in conf.json",
 )
@@ -99,6 +102,10 @@ parser.add_argument(
     default=None,
     help="Backward-compatible single-orbit override.",
 )
+parser.add_argument("--mid-num-bins", default=None, type=int)
+parser.add_argument("--mid-low-memory", action="store_true", default=None)
+parser.add_argument("--mid-start-day", default=None, type=float)
+parser.add_argument("--mid-end-day", default=None, type=float)
 
 def main(config):
     np.random.seed(config.rdm_seed)
@@ -123,7 +130,7 @@ def main(config):
         checkpoint_fold = getattr(config, "checkpoint_fold", None) or test_fold
 
         # Dataset definition
-        sats = _mm_satellites(config) if config.model == "mm_ucpmamba" else ["S2"]
+        sats = _mm_satellites(config) if _is_mm_model(config) else ["S2"]
         dt_test = PASTIS_Dataset(
             folder=config.dataset_folder,
             norm=True,
@@ -134,6 +141,8 @@ def main(config):
             folds=test_fold_ids,
         )
         collate_fn = lambda x: utils.pad_collate(x, pad_value=config.pad_value)
+        if config.model == "mm_ucpmamba_mid":
+            collate_fn = partial(mid_pad_collate, pad_value=config.pad_value)
         test_loader = data.DataLoader(
             dt_test,
             batch_size=config.batch_size,
