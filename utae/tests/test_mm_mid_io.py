@@ -204,7 +204,8 @@ def test_collate_selection_uses_mid_only(filename):
     guards = [node for node in ast.walk(tree) if isinstance(node, ast.If)
               and "mid_pad_collate" in ast.unparse(node)]
     guard = next(node for node in guards if isinstance(node.test, ast.Compare)
-                 and ast.unparse(node.test) == "config.model == 'mm_ucpmamba_mid'")
+                 and isinstance(node.test.left, ast.Attribute)
+                 and ast.unparse(node.test.left) == "config.model")
     selected = next(node for node in guard.body if isinstance(node, ast.Assign))
     code = compile(ast.Module(body=[guard], type_ignores=[]), filename, "exec")
     marker = object()

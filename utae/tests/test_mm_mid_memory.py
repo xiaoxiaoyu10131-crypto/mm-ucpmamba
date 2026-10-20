@@ -198,7 +198,7 @@ def test_low_memory_cpu_autocast_forward_backward_is_finite(mid_module):
     assert instance.s2_branch.in_conv.conv.conv[0].weight.grad.count_nonzero() > 0
 
 
-def test_low_memory_cli_defaults_and_model_routing(mid_module):
+def test_low_memory_cli_defaults_and_model_routing(mid_module, monkeypatch):
     tree = ast.parse((ROOT / "train_semantic.py").read_text(encoding="utf-8"))
     argument = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute) and node.func.attr == "add_argument"
@@ -225,6 +225,8 @@ def test_low_memory_cli_defaults_and_model_routing(mid_module):
     routed = namespace["get_model"](config)
     assert all(branch.low_memory for branch in routed.spatial_branches.values())
     config.model = "mm_ucpmamba"
+    monkeypatch.setattr(sys.modules["src.backbones.mm_ucpmamba"], "MMUCPMamba",
+                        lambda **kwargs: original_calls.append(kwargs))
     namespace["get_model"](config)
     assert "low_memory" not in original_calls[0]
 

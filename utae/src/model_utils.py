@@ -1,7 +1,30 @@
-from src.backbones import utae, unet3d, convlstm, convgru, fpn, ucpmamba, uconvlstm, mm_ucpmamba
+from src.backbones import utae
+
+
+def __getattr__(name):
+    """按需保留旧调用方对 backbone 模块属性的访问。"""
+    if name in {"unet3d", "convlstm", "convgru", "fpn", "ucpmamba", "uconvlstm", "mm_ucpmamba"}:
+        from importlib import import_module
+
+        module = import_module(f"src.backbones.{name}")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def get_model(config, mode="semantic"):
+    if mode == "semantic" and config.model == "mm_ucpmamba_async":
+        from src.mm_async_experiment import build_async
+
+        return build_async(config)
+
+    if mode == "semantic" and config.model == "mm_utae":
+        from src.mm_utae_experiment import build_mm_utae
+
+        return build_mm_utae(config)
+
+    from src.backbones import unet3d, convlstm, convgru, fpn, ucpmamba, uconvlstm, mm_ucpmamba
+
     if mode == "semantic":
         if config.model == "utae":
             model = utae.UTAE(

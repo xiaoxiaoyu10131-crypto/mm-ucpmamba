@@ -234,7 +234,7 @@ def test_cli_exposes_new_model_and_window_parameters():
     assert ast.literal_eval(default) == 24
 
 
-def test_model_routing_preserves_original_interface(mid_module):
+def test_model_routing_preserves_original_interface(mid_module, monkeypatch):
     tree = ast.parse((ROOT / "src/model_utils.py").read_text(encoding="utf-8"))
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                     and node.name == "get_model")
@@ -259,6 +259,7 @@ def test_model_routing_preserves_original_interface(mid_module):
     assert routed.aligner.num_bins == 24
     assert (routed.aligner.start_day, routed.aligner.end_day) == (0, 40)
     config.model = "mm_ucpmamba"
+    monkeypatch.setattr(sys.modules["src.backbones.mm_ucpmamba"], "MMUCPMamba", original_model)
     assert namespace["get_model"](config) == "original"
     assert not {"num_bins", "start_day", "end_day"} & set(original_calls[0])
 

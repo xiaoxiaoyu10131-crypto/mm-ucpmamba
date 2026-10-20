@@ -17,6 +17,8 @@ import torch.utils.data as data
 from src import utils, model_utils
 from src.dataset import PASTIS_Dataset
 from src.mm_collate import mid_pad_collate
+from src.mm_async_collate import async_pad_collate
+from src.mm_async_experiment import add_async_arguments, check_async_checkpoint
 from src.folds import FOLD_SPLITS, get_fold_split
 
 from train_semantic import (
@@ -38,7 +40,7 @@ parser.add_argument(
         "utae", "unet3d", "fpn", "convlstm", "convgru", "uconvlstm",
         "ucpmamba", "ucpmamba_vmambav2", "ucpmamba_mamba2",
         "ucpmamba_directvss",
-        "ucpmamba_mean", "ucpmamba_plainlstm", "mm_ucpmamba", "mm_ucpmamba_mid", "buconvlstm",
+        "ucpmamba_mean", "ucpmamba_plainlstm", "mm_ucpmamba", "mm_ucpmamba_mid", "mm_ucpmamba_async", "mm_utae", "buconvlstm",
     ],
     help="Override the model name stored in conf.json",
 )
@@ -102,6 +104,7 @@ parser.add_argument(
     default=None,
     help="Backward-compatible single-orbit override.",
 )
+add_async_arguments(parser, inference=True)
 parser.add_argument("--mid-num-bins", default=None, type=int)
 parser.add_argument("--mid-low-memory", action="store_true", default=None)
 parser.add_argument("--mid-start-day", default=None, type=float)
@@ -141,8 +144,10 @@ def main(config):
             folds=test_fold_ids,
         )
         collate_fn = lambda x: utils.pad_collate(x, pad_value=config.pad_value)
-        if config.model == "mm_ucpmamba_mid":
+        if config.model in {"mm_ucpmamba_mid", "mm_ucpmamba_async"}:
             collate_fn = partial(mid_pad_collate, pad_value=config.pad_value)
+        if config.model == "mm_ucpmamba_async":
+            collate_fn = partial(async_pad_collate, pad_value=config.pad_value)
         test_loader = data.DataLoader(
             dt_test,
             batch_size=config.batch_size,
@@ -160,6 +165,7 @@ def main(config):
             ),
             map_location=device,
         )
+        check_async_checkpoint(sd, config)
         model.load_state_dict(sd["state_dict"], strict=True)
 
         # Loss
@@ -186,7 +192,7 @@ def main(config):
                 test_metrics["test_IoU"],
             )
         )
-        save_results(test_fold, test_metrics, conf_mat.cpu().numpy(), config)
+        save_results(test_fold, test_metrics, conf_mat, config)
 
     if config.fold is None:
         overall_performance(config)

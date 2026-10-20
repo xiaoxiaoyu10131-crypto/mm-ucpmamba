@@ -179,6 +179,13 @@ class MMUCPMambaMid(nn.Module):
                 valid[name] = valid[name] & ~drop[:, i, None, None, None, None]
         return reference, valid, pads, dropped
 
+    def _align_modality(self, name, features, positions, pads, valid):
+        pooled, available, counts = self.aligner(features, positions, pads, valid)
+        return pooled, available, counts, {}
+
+    def _interact_aligned(self, aligned, valid, info):
+        return aligned, {}
+
     def forward(
         self,
         x_s2,
@@ -209,6 +216,7 @@ class MMUCPMambaMid(nn.Module):
             {},
             {},
         )
+        alignment_info = {}
         for name in self.active_modalities:
             if inputs[name] is None:
                 aligned[name] = reference.new_zeros(b, k, self.encoder_widths[2], *self.sizes[2])
@@ -233,7 +241,8 @@ class MMUCPMambaMid(nn.Module):
                 skip_valid,
                 frame_pad,
             )
-            aligned[name], aligned_valid[name], counts[name] = self.aligner(
+            aligned[name], aligned_valid[name], counts[name], alignment_info[name] = self._align_modality(
+                name,
                 features,
                 positions[name],
                 pads[name],
@@ -245,6 +254,7 @@ class MMUCPMambaMid(nn.Module):
             reference.dtype,
         )
         aligned = {n: feature.to(feature_dtype) for n, feature in aligned.items()}
+        aligned, interaction_debug = self._interact_aligned(aligned, aligned_valid, alignment_info)
         shallow_skips = {
             n: [feature.to(feature_dtype) for feature in features]
             for n, features in shallow_skips.items()
@@ -284,6 +294,8 @@ class MMUCPMambaMid(nn.Module):
             "logits": logits,
             "aligned_valid": aligned_valid,
             "aligned_counts": counts,
+            "alignment_info": alignment_info,
+            "interaction_debug": interaction_debug,
             "window_pad_mask": window_pad,
             "temporal_pad_mask": temporal_pad,
             "pixel_valid": pixel_valid,

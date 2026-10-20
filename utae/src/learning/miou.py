@@ -204,6 +204,7 @@ class IoU(Metric):
             is the mean IoU.
         """
         conf_matrix = self.conf_metric.value()
+        conf_matrix = conf_matrix.clone() if torch.is_tensor(conf_matrix) else conf_matrix.copy()
         if self.ignore_index is not None:
             conf_matrix[:, self.ignore_index] = 0
             conf_matrix[self.ignore_index, :] = 0
@@ -219,6 +220,7 @@ class IoU(Metric):
 
     def get_miou_acc(self):
         conf_matrix = self.conf_metric.value()
+        conf_matrix = conf_matrix.clone() if torch.is_tensor(conf_matrix) else conf_matrix.copy()
         if torch.is_tensor(conf_matrix):
             conf_matrix = conf_matrix.cpu().numpy()
         if self.ignore_index is not None:

@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.backbones.convlstm import ConvLSTM, BConvLSTM
 from src.backbones.ltae import LTAE2d
 
 class UTAE(nn.Module):
@@ -594,7 +593,7 @@ class RecUNet(nn.Module):
         encoder=False,
         padding_mode="reflect",
         pad_value=0,
-        temporal_encoder_class=ConvLSTM,
+        temporal_encoder_class=None,
         skip_aggregation="phenology",
         decoder_norm="batch",
     ):
@@ -700,6 +699,10 @@ class RecUNet(nn.Module):
         if temporal == "mean":
             self.temporal_encoder = Temporal_Aggregator(mode="mean")
         elif temporal == "lstm":
+            if temporal_encoder_class is None:
+                from src.backbones.convlstm import ConvLSTM
+
+                temporal_encoder_class = ConvLSTM
             size = int(input_size / str_conv_s ** (self.n_stages - 1))
             self.temporal_encoder = temporal_encoder_class(
                 input_dim=encoder_widths[-1],
@@ -714,6 +717,8 @@ class RecUNet(nn.Module):
                 padding=1,
             )
         elif temporal == "blstm":
+            from src.backbones.convlstm import BConvLSTM
+
             size = int(input_size / str_conv_s ** (self.n_stages - 1))
             self.temporal_encoder = BConvLSTM(
                 input_dim=encoder_widths[-1],

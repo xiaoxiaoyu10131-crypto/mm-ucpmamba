@@ -20,6 +20,7 @@ import torchnet as tnt
 from src import utils, model_utils
 from src.dataset import PASTIS_Dataset
 from src.mm_collate import mid_pad_collate
+from src.mm_async_collate import async_pad_collate
 from src.backbones.mm_mid_memory import report_mid_oom
 from src.folds import FOLD_SPLITS, get_fold_split
 from src.learning.metrics import confusion_matrix_analysis
@@ -32,6 +33,11 @@ from src.learning.weight_init import (
     find_final_batchnorm,
     reset_final_batchnorm_identity,
     weight_init,
+)
+from src.mm_utae_experiment import initialize_mm_utae_heads, mm_utae_loss
+from src.mm_async_experiment import (
+    add_async_arguments, benchmark_async, configure_async, save_async_last, save_async_metrics,
+    source_provenance,
 )
 
 parser = argparse.ArgumentParser()
@@ -55,12 +61,14 @@ parser.add_argument(
         "ucpmamba_plainlstm",
         "mm_ucpmamba",
         "mm_ucpmamba_mid",
+        "mm_ucpmamba_async",
+        "mm_utae",
         "buconvlstm",
     ],
     help=(
         "Semantic segmentation architecture. Use uconvlstm for the original "
         "baseline, ucpmamba, ucpmamba_vmambav2, ucpmamba_mamba2, and "
-        "ucpmamba_mean, or mm_ucpmamba for independent Optical-SAR fusion."
+        "ucpmamba_mean, mm_ucpmamba or mm_utae for independent Optical-SAR fusion."
     ),
 )
 ## U-TAE Hyperparameters
@@ -75,6 +83,7 @@ parser.add_argument("--sar-input-dim", dest="sar_input_dim", default=3, type=int
 parser.add_argument(
     "--fusion-mode", dest="fusion_mode", choices=["concat", "qaf"], default="concat"
 )
+add_async_arguments(parser)
 parser.add_argument("--mid-num-bins", default=24, type=int)
 parser.add_argument(
     "--mid-low-memory", action="store_true",
@@ -103,6 +112,14 @@ parser.set_defaults(use_complementary_residual=True)
 parser.add_argument("--use-quality-temporal", dest="use_quality_temporal", action="store_true")
 parser.add_argument("--quality-lambda", dest="quality_lambda", default=1.0, type=float)
 parser.add_argument("--modality-dropout", dest="modality_dropout", default=0.0, type=float)
+parser.add_argument(
+    "--mm-utae-aux-weight", default=0.0, type=float,
+    help="MM-UTAE only: auxiliary CE weight per modality (paper: 0.5; comparison: 0).",
+)
+parser.add_argument(
+    "--mm-utae-head", choices=["legacy", "logits"], default="legacy",
+    help="MM-UTAE only: match the current classifier or use raw logits.",
+)
 parser.add_argument("--temporal-dropout-s2", default=0.4, type=float)
 parser.add_argument("--temporal-dropout-s1a", default=0.2, type=float)
 parser.add_argument("--temporal-dropout-s1d", default=0.2, type=float)
@@ -284,19 +301,39 @@ def _mm_satellites(config):
 
 
 def _is_mm_model(config):
-    return config.model in {"mm_ucpmamba", "mm_ucpmamba_mid"}
+    return config.model in {"mm_ucpmamba", "mm_ucpmamba_mid", "mm_ucpmamba_async", "mm_utae"}
 
 
 def _set_mm_experiment_metadata(config):
+    if config.model == "mm_ucpmamba_async":
+        configure_async(config)
     if not _is_mm_model(config):
         return
     modalities = _mm_satellites(config)
     all_channels = {"S2": 10, "S1A": 3, "S1D": 3}
     config.active_modalities = modalities
     config.input_channels = {sat: all_channels[sat] for sat in modalities}
-    config.mamba_variant = "Mamba1-SS2D-v01_noz-d_state16-ratio1.0"
+    config.mamba_variant = (
+        None if config.model == "mm_utae"
+        else "Mamba1-SS2D-v01_noz-d_state16-ratio1.0"
+    )
     config.experiment_name = config.model + "_" + "_".join(s.lower() for s in modalities)
-    if config.model == "mm_ucpmamba_mid":
+    if config.model == "mm_utae":
+        from src.mm_utae_experiment import validate_mm_utae_config
+
+        validate_mm_utae_config(config)
+        config.input_channels = {
+            sat: getattr(config, "optical_input_dim", 10) if sat == "S2"
+            else getattr(config, "sar_input_dim", 3) for sat in modalities
+        }
+        config.mm_utae_reconstruction = {
+            "implementation": "official U-TAE branches with reconstructed late fusion",
+            "fusion_location": "after each full U-TAE spatial decoder",
+            "head": getattr(config, "mm_utae_head", "legacy"),
+            "auxiliary_weight": getattr(config, "mm_utae_aux_weight", 0.0),
+            "exact_author_implementation": False,
+        }
+    if config.model in {"mm_ucpmamba_mid", "mm_ucpmamba_async"}:
         config.mid_alignment = {
             "num_bins": getattr(config, "mid_num_bins", 24),
             "start_day": getattr(config, "mid_start_day", None),
@@ -308,11 +345,11 @@ def _set_mm_experiment_metadata(config):
         config.res_dir = os.path.join(config.res_dir, config.experiment_name)
 
 
-def _forward_model(model, x, dates, config):
+def _forward_model(model, x, dates, config, return_aux=False):
     if not _is_mm_model(config):
         return model(x, batch_positions=dates)
     if not isinstance(x, dict) or not isinstance(dates, dict):
-        raise TypeError("multimodal UCPMamba expects a multimodal dict batch")
+        raise TypeError("multimodal models expect a multimodal dict batch")
     optical_satellite = getattr(config, "optical_satellite", "S2")
     sar_orbits = _active_sar_orbits(config)
     if optical_satellite not in x or optical_satellite not in dates:
@@ -321,7 +358,9 @@ def _forward_model(model, x, dates, config):
         if orbit not in x or orbit not in dates:
             raise KeyError(f"{orbit} is missing from the multimodal batch")
     mask_kwargs = {}
-    if config.model == "mm_ucpmamba_mid":
+    if config.model == "mm_utae":
+        mask_kwargs["return_aux"] = return_aux
+    if config.model in {"mm_ucpmamba_mid", "mm_ucpmamba_async"}:
         mask_kwargs = {
             "pad_masks": x.get("pad_masks"),
             "valid_masks": x.get("valid_masks"),
@@ -349,12 +388,19 @@ def _diagnostic_ignore_labels(config):
 def _classifier_parameter(model, num_classes):
     candidates = []
     for name, parameter in model.named_parameters():
+        if hasattr(model, "fusion_head") and not name.startswith("fusion_head."):
+            continue
         if name.endswith("weight") and parameter.ndim == 4 and parameter.shape[0] == num_classes:
             candidates.append((name, parameter))
     return candidates[-1] if candidates else (None, None)
 
 
 def _classifier_batchnorm(model, num_classes):
+    if hasattr(model, "fusion_head"):
+        if model.head_mode == "logits":
+            return None, None
+        name, module = find_final_batchnorm(model.fusion_head, num_classes)
+        return (f"fusion_head.{name}", module) if name is not None else (None, None)
     return find_final_batchnorm(model, num_classes)
 
 
@@ -443,6 +489,8 @@ def _diagnostic_metrics(stats, mode):
 def iterate(
     model, data_loader, criterion, config, optimizer=None, mode="train", device=None
 ):
+    if config.model == "mm_ucpmamba_async" and device is None:
+        device = next(model.parameters()).device
     loss_meter = tnt.meter.AverageValueMeter()
     # 跟踪所有批次的平均损失
     iou_meter = IoU(
@@ -483,6 +531,11 @@ def iterate(
     # 计算多分类任务的交并比和准确率
 
     t_start = time.time()
+    async_totals = {}
+    sequence_lengths = {}
+    observed_lengths = {}
+    if config.model == "mm_ucpmamba_async" and device is not None and device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     accumulation_steps = getattr(config, "accumulation_steps", 1)
     if mode == "train":
         if optimizer is None:
@@ -492,6 +545,14 @@ def iterate(
         if device is not None:
             batch = recursive_todevice(batch, device)
         (x, dates), y = batch
+        if config.model == "mm_ucpmamba_async":
+            for name, tensor in x.items():
+                if torch.is_tensor(tensor) and tensor.ndim == 5:
+                    sequence_lengths[name] = max(sequence_lengths.get(name, 0), tensor.shape[1])
+                    lengths = (~x["pad_masks"][name]).sum(1).detach().cpu().tolist()
+                    record = observed_lengths.setdefault(name, {"min": float("inf"), "max": 0, "sum": 0, "samples": 0})
+                    record.update(min=min(record["min"], min(lengths)), max=max(record["max"], max(lengths)),
+                                  sum=record["sum"] + sum(lengths), samples=record["samples"] + len(lengths))
         y = y.long()
         # 使用recursive_todevice将数据加载到指定的设备上
         # 将批次数据解包为输入数据x、时间信息dates和标签y
@@ -501,9 +562,20 @@ def iterate(
             with torch.no_grad():
                 out = _forward_model(model, x, dates, config)
         else:
-            out = _forward_model(model, x, dates, config)
+            out = _forward_model(
+                model, x, dates, config,
+                return_aux=(config.model == "mm_utae"
+                            and getattr(config, "mm_utae_aux_weight", 0.0) > 0),
+            )
 
-        loss = criterion(out, y)
+        if config.model == "mm_ucpmamba_async":
+            for key, value in model.last_diagnostics.items():
+                async_totals[key] = value.detach() if key.startswith("gamma_") else async_totals.get(key, 0) + value.detach()
+        if config.model == "mm_utae":
+            aux_weight = getattr(config, "mm_utae_aux_weight", 0.0) if mode == "train" else 0.0
+            out, loss = mm_utae_loss(out, y, criterion, aux_weight)
+        else:
+            loss = criterion(out, y)
         if mode == "train":
             window_size = accumulation_window_size(
                 i, len(data_loader), accumulation_steps
@@ -511,7 +583,7 @@ def iterate(
             try:
                 (loss / window_size).backward()
             except torch.cuda.OutOfMemoryError:
-                if config.model == "mm_ucpmamba_mid":
+                if config.model in {"mm_ucpmamba_mid", "mm_ucpmamba_async"}:
                     report_mid_oom(x, device)
                 raise
             update_boundary = is_accumulation_boundary(
@@ -612,6 +684,18 @@ def iterate(
         metrics[f"{mode}_nonfinite_classifier_gradient_batches"] = nonfinite_classifier_gradient_batches
     if hook_handle is not None:
         hook_handle.remove()
+    if config.model == "mm_ucpmamba_async":
+        metrics[f"{mode}_async"] = {k: v.cpu().tolist() for k, v in async_totals.items()}
+        metrics[f"{mode}_max_padded_lengths"] = sequence_lengths
+        metrics[f"{mode}_observed_lengths"] = observed_lengths
+        metrics[f"{mode}_learning_rate"] = float(optimizer.param_groups[0]["lr"]) if optimizer else None
+        metrics[f"{mode}_precision"] = str(next(model.parameters()).dtype)
+        metrics[f"{mode}_batch_size"] = config.batch_size
+        metrics[f"{mode}_gpu"] = torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"
+        metrics[f"{mode}_peak_allocated_mib"] = torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else None
+        metrics[f"{mode}_peak_reserved_mib"] = torch.cuda.max_memory_reserved(device) / 2**20 if device.type == "cuda" else None
+        if mode == "test" and sequence_lengths:
+            metrics["test_inference_benchmark"] = benchmark_async(model, x, dates, _forward_model, config)
     # 将当前模式对应的指标汇总为一个字典
 
     if mode == "test":
@@ -672,6 +756,10 @@ def checkpoint(fold, log, config):
 
 
 def save_results(fold, metrics, conf_mat, config):
+    conf_mat = conf_mat.detach().cpu().numpy() if torch.is_tensor(conf_mat) else np.asarray(conf_mat)
+    if config.model == "mm_ucpmamba_async":
+        save_async_metrics(os.path.join(config.res_dir, f"Fold_{fold}", "class_metrics.json"),
+                           conf_mat, config.ignore_index)
     with open(
         os.path.join(config.res_dir, "Fold_{}".format(fold), "test_metrics.json"), "w"
     ) as outfile:
@@ -764,7 +852,7 @@ def main(config):
         # **dt_args: 传入通用的参数，包括数据集路径、归一化设置、基准日期、模式等。
         # 默认情况下不做时间 dropout（设为 None），也就是数据集会使用完整的时间序列。
         temporal_dropout = None
-        # 只有当选用的模型是多模态 UCPMamba（mm_ucpmamba）时，才启用时间 dropout，并且为三种模态分别从命令行/配置里读取各自的丢弃概率，组成一个字典。
+        # 多模态模型共用训练专用 temporal dropout，验证和测试使用完整时序。
         if _is_mm_model(config):
             temporal_dropout = {
                 "S2": config.temporal_dropout_s2,
@@ -783,8 +871,10 @@ def main(config):
         torch.cuda.empty_cache()
 
         collate_fn = lambda x: utils.pad_collate(x, pad_value=config.pad_value)
-        if config.model == "mm_ucpmamba_mid":
+        if config.model in {"mm_ucpmamba_mid", "mm_ucpmamba_async"}:
             collate_fn = partial(mid_pad_collate, pad_value=config.pad_value)
+        if config.model == "mm_ucpmamba_async":
+            collate_fn = partial(async_pad_collate, pad_value=config.pad_value)
         # 使用自定义的 pad_collate 函数对批数据进行动态填充（padding）。
         # pad_value：填充值，避免时间步长不一致导致的错误。
         train_loader = data.DataLoader(
@@ -850,10 +940,18 @@ def main(config):
         # 用于调试冻结或解冻特定层的问题
         model = model.to(device)
         model.apply(weight_init)
+        if config.model == "mm_ucpmamba_async":
+            model.reset_async_initialization()
+            config.code_provenance = source_provenance()
+            with open(os.path.join(config.res_dir, f"Fold_{test_fold}", "config.json"), "w") as file:
+                json.dump(vars(config), file, indent=2)
         if config.final_bn_init == "ones":
-            final_bn_name = reset_final_batchnorm_identity(
-                model, config.num_classes
-            )
+            if config.model == "mm_utae":
+                final_bn_name = initialize_mm_utae_heads(model, config.num_classes)
+            else:
+                final_bn_name = reset_final_batchnorm_identity(
+                    model, config.num_classes
+                )
             print(
                 f"H1 final BatchNorm identity initialization: {final_bn_name} "
                 "(weight=1, bias=0)"
@@ -918,6 +1016,7 @@ def main(config):
                             "epoch": epoch,
                             "state_dict": model.state_dict(),
                             "optimizer": optimizer.state_dict(),
+                            "config": vars(config) if config.model == "mm_ucpmamba_async" else None,
                             "model_metadata": {
                                 "model_name": config.model,
                                 "active_modalities": getattr(config, "active_modalities", ["S2"]),
@@ -925,6 +1024,8 @@ def main(config):
                                 "fusion_mode": getattr(config, "fusion_mode", None),
                                 "mamba_variant": getattr(config, "mamba_variant", None),
                                 "mid_alignment": getattr(config, "mid_alignment", None),
+                                "async_design": getattr(config, "async_design", None),
+                                "mm_utae_reconstruction": getattr(config, "mm_utae_reconstruction", None),
                             },
                         },
                         os.path.join(
@@ -934,6 +1035,8 @@ def main(config):
             else:
                 trainlog[epoch] = {**train_metrics}
                 checkpoint(test_fold, trainlog, config)
+            if config.model == "mm_ucpmamba_async":
+                save_async_last(model, optimizer, config, test_fold, epoch, best_mIoU)
         #         通过 checkpoint 函数保存训练日志到文件中。
         # 记录每个 epoch 的训练和验证结果，便于后续分析
 
@@ -964,7 +1067,7 @@ def main(config):
                 test_metrics["test_IoU"],
             )
         )
-        save_results(test_fold, test_metrics, conf_mat.cpu().numpy(), config)
+        save_results(test_fold, test_metrics, conf_mat, config)
 
     if config.fold is None:
         overall_performance(config)
